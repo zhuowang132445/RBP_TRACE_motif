@@ -1,0 +1,7 @@
+Protein	Motif_ID	Family_Label	Representative_RNA	Seed_RNA	N_Selected_Members	Selected_Total_Weight	N_Family_Members	Family_Total_Weight	Top_Baseline_Z	Weight_Fraction
+w1	1	seed_centered_top10	UUUUUUU	UUUUUUU	10	1.0	10	1.0	13.166611671447754	1.0
+w2	1	seed_centered_top10	CUUCUCU	CUUCUCU	10	1.0	10	1.0	5.2469482421875	1.0
+w3	1	seed_centered_top10	GUGUGUG	GUGUGUG	10	1.0	10	1.0	10.104708671569824	1.0
+w4	1	seed_centered_top10	UUUUUUU	UUUUUUU	10	1.0000000000000002	10	1.0000000000000002	14.791029930114746	1.0
+w6	1	seed_centered_top10	UUUUUUU	UUUUUUU	10	1.0	10	1.0	14.400860786437988	1.0
+AtPTBP3	1	seed_centered_top10	CUUUCUU	CUUUCUU	10	1.0	10	1.0	5.595311164855957	1.0
