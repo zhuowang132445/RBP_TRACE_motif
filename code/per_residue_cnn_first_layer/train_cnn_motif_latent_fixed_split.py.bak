@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+"""Train per-residue RBD CNN motif model from a fixed train/val/test split."""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import json
+import os
+import random
+import sys
+from pathlib import Path
+
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from scipy.stats import pearsonr, spearmanr
+from sklearn.decomposition import TruncatedSVD
+from sklearn.preprocessing import StandardScaler
+from torch.utils.data import DataLoader
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT = SCRIPT_DIR.parents[1]
+sys.path.insert(0, str(SCRIPT_DIR))
+
+from cnn_model_utils import (  # noqa: E402
+    PerResidueCnn,
+    RbdEmbeddingDataset,
+    collate_batch,
+    first_key,
+    load_h5_features,
+    resolve_path,
+    setup_threads,
+)
+
+
+def log(msg: str) -> None:
+    print(f"[fixed-split-cnn] {msg}", flush=True)
+
+
+def seed_all(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def load_motif(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, int]]:
+    z = np.load(path, allow_pickle=True)
+    ids = np.asarray(z[first_key(z, ["profile_ids", "protein_ids", "ids", "names"])]).astype(str)
+    y = np.asarray(z[first_key(z, ["zscores", "scores", "Y", "profiles"])], dtype=np.float32)
+    kmers = np.asarray(z["kmers"]).astype(str)
+    return ids, y, kmers, {pid: i for i, pid in enumerate(ids)}
+
+
+def ids_from_split(split_tsv: Path, split_name: str, motif_ids: set[str], x_map: dict[str, np.ndarray]) -> list[str]:
+    df = pd.read_csv(split_tsv, sep="\t")
+    if "protein_id" not in df.columns or "split" not in df.columns:
+        raise ValueError("split TSV must contain protein_id and split columns")
+    ids = df.loc[df["split"].astype(str) == split_name, "protein_id"].astype(str).tolist()
+    return [pid for pid in ids if pid in motif_ids and pid in x_map]
+
+
+def make_targets(
+    ids: list[str],
+    y: np.ndarray,
+    id2y: dict[str, int],
+    scaler: StandardScaler,
+    svd: TruncatedSVD,
+    lat_mean: np.ndarray,
+    lat_std: np.ndarray,
+    latent_dim: int,
+) -> np.ndarray:
+    out = np.zeros((len(id2y), latent_dim), dtype=np.float32)
+    if ids:
+        y_scaled = scaler.transform(y[[id2y[pid] for pid in ids]]).astype(np.float32)
+        lat = svd.transform(y_scaled).astype(np.float32)
+        z = (lat - lat_mean) / lat_std
+        for pid, row in zip(ids, z):
+            out[id2y[pid]] = row
+    return out
+
+
+def reconstruct(pred_z: np.ndarray, ckpt_data: dict[str, np.ndarray]) -> np.ndarray:
+    pred_lat = pred_z * ckpt_data["lat_std"] + ckpt_data["lat_mean"]
+    pred_scaled = pred_lat @ ckpt_data["svd_components"]
+    return pred_scaled * ckpt_data["scaler_scale"] + ckpt_data["scaler_mean"]
+
+
+def eval_profile_metrics(
+    model: nn.Module,
+    ids: list[str],
+    x_map: dict[str, np.ndarray],
+    y: np.ndarray,
+    id2y: dict[str, int],
+    target_z: np.ndarray,
+    ckpt_data: dict[str, np.ndarray],
+    batch_size: int,
+    device: torch.device,
+) -> dict[str, float]:
+    if not ids:
+        return {"n": 0}
+    loader = DataLoader(
+        RbdEmbeddingDataset(ids, x_map, target_z, id2y),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=collate_batch,
+    )
+    rows = []
+    model.eval()
+    with torch.no_grad():
+        for batch_ids, x, mask, _ in loader:
+            pred_z = model(x.to(device), mask.to(device)).cpu().numpy()
+            pred_y = reconstruct(pred_z, ckpt_data)
+            for pid, pred in zip(batch_ids, pred_y):
+                true = y[id2y[pid]]
+                pearson = pearsonr(true, pred)[0]
+                spearman = spearmanr(true, pred)[0]
+                true_top = set(np.argsort(-true)[:20].tolist())
+                pred_top = set(np.argsort(-pred)[:20].tolist())
+                rows.append(
+                    {
+                        "pearson": float(pearson),
+                        "spearman": float(spearman),
+                        "top20_overlap": float(len(true_top & pred_top) / 20.0),
+                    }
+                )
+    df = pd.DataFrame(rows)
+    return {
+        "n": int(len(df)),
+        "pearson_mean": float(df["pearson"].mean()),
+        "spearman_mean": float(df["spearman"].mean()),
+        "top20_overlap_mean": float(df["top20_overlap"].mean()),
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--split-tsv", required=True)
+    ap.add_argument("--per-residue-h5", default="results/per_residue_cnn_first_layer/features/rnacompete_rbd_per_residue_esmc.h5")
+    ap.add_argument("--per-residue-manifest", default="results/per_residue_cnn_first_layer/features/rnacompete_rbd_per_residue_manifest.tsv")
+    ap.add_argument("--motif-npz", default="data/processed/motif_profiles.npz")
+    ap.add_argument("--output-dir", required=True)
+    ap.add_argument("--device", default="cuda", choices=["cpu", "cuda", "auto"])
+    ap.add_argument("--gpu-memory-fraction", type=float, default=0.20)
+    ap.add_argument("--batch-size", type=int, default=4)
+    ap.add_argument("--epochs", type=int, default=200)
+    ap.add_argument("--patience", type=int, default=20)
+    ap.add_argument("--learning-rate", type=float, default=1e-4)
+    ap.add_argument("--weight-decay", type=float, default=1e-4)
+    ap.add_argument("--gradient-clip", type=float, default=1.0)
+    ap.add_argument("--latent-dim", type=int, default=50)
+    ap.add_argument("--hidden-dim", type=int, default=64)
+    ap.add_argument("--dropout", type=float, default=0.3)
+    ap.add_argument("--kernel-size", type=int, default=5)
+    ap.add_argument("--num-blocks", type=int, default=2)
+    ap.add_argument("--ranking-loss-weight", type=float, default=0.03)
+    ap.add_argument("--ranking-top-k", type=int, default=20)
+    ap.add_argument("--ranking-margin", type=float, default=0.5)
+    ap.add_argument("--torch-num-threads", type=int, default=1)
+    ap.add_argument("--seed", type=int, default=20260617)
+    return ap.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    setup_threads(args.torch_num_threads)
+    seed_all(args.seed)
+    if args.device == "auto":
+        args.device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.device == "cuda" and not torch.cuda.is_available():
+        args.device = "cpu"
+    device = torch.device(args.device)
+    if device.type == "cuda" and args.gpu_memory_fraction > 0:
+        torch.cuda.set_per_process_memory_fraction(args.gpu_memory_fraction, 0)
+
+    out = Path(args.output_dir)
+    out = ROOT / out if not out.is_absolute() else out
+    out.mkdir(parents=True, exist_ok=True)
+
+    split_tsv = resolve_path(args.split_tsv, [Path(args.split_tsv).name])
+    h5_path = resolve_path(args.per_residue_h5, ["rnacompete_rbd_per_residue_esmc.h5"])
+    manifest_path = resolve_path(args.per_residue_manifest, ["rnacompete_rbd_per_residue_manifest.tsv"], required=False)
+    motif_path = resolve_path(args.motif_npz, ["motif_profiles.npz"])
+
+    x_map, _ = load_h5_features(h5_path, manifest_path)
+    motif_ids, y, kmers, id2y = load_motif(motif_path)
+    motif_id_set = set(motif_ids)
+    train_ids = ids_from_split(split_tsv, "train", motif_id_set, x_map)
+    val_ids = ids_from_split(split_tsv, "val", motif_id_set, x_map)
+    test_ids = ids_from_split(split_tsv, "test", motif_id_set, x_map)
+    if not train_ids or not val_ids:
+        raise RuntimeError(f"Need non-empty train and val sets, got train={len(train_ids)} val={len(val_ids)}")
+
+    y_train = y[[id2y[pid] for pid in train_ids]]
+    scaler = StandardScaler(with_mean=True, with_std=True)
+    y_train_scaled = scaler.fit_transform(y_train).astype(np.float32)
+    latent_dim = max(2, min(args.latent_dim, len(train_ids) - 1, y.shape[1] - 1))
+    svd = TruncatedSVD(n_components=latent_dim, random_state=args.seed)
+    train_lat = svd.fit_transform(y_train_scaled).astype(np.float32)
+    lat_mean = train_lat.mean(axis=0, keepdims=True).astype(np.float32)
+    lat_std = train_lat.std(axis=0, keepdims=True).astype(np.float32)
+    lat_std[lat_std < 1e-6] = 1.0
+
+    train_target = make_targets(train_ids, y, id2y, scaler, svd, lat_mean, lat_std, latent_dim)
+    val_target = make_targets(val_ids, y, id2y, scaler, svd, lat_mean, lat_std, latent_dim)
+    test_target = make_targets(test_ids, y, id2y, scaler, svd, lat_mean, lat_std, latent_dim)
+
+    train_loader = DataLoader(
+        RbdEmbeddingDataset(train_ids, x_map, train_target, id2y),
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=0,
+        collate_fn=collate_batch,
+    )
+    val_loader = DataLoader(
+        RbdEmbeddingDataset(val_ids, x_map, val_target, id2y),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=collate_batch,
+    )
+
+    model = PerResidueCnn(
+        next(iter(x_map.values())).shape[1],
+        args.hidden_dim,
+        latent_dim,
+        args.kernel_size,
+        args.num_blocks,
+        args.dropout,
+    ).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    mse = nn.MSELoss()
+    kmer_to_idx = {k: i for i, k in enumerate(kmers)}
+    decoy_kmers = ["UUUUUUU", "UUUUUUC", "UUUUUUG", "CUUUUUU", "AUUUUUU", "GUUUUUU", "UUUUUCU", "UUUUUCG"]
+    decoy_idx = [kmer_to_idx[k] for k in decoy_kmers if k in kmer_to_idx]
+    pos_idx_map = {pid: np.argsort(-y[id2y[pid]])[: args.ranking_top_k].astype(int) for pid in train_ids}
+
+    comp_t = torch.tensor(svd.components_, device=device, dtype=torch.float32)
+    scale_t = torch.tensor(scaler.scale_, device=device, dtype=torch.float32)
+    mean_t = torch.tensor(scaler.mean_, device=device, dtype=torch.float32)
+    lat_mean_t = torch.tensor(lat_mean, device=device, dtype=torch.float32)
+    lat_std_t = torch.tensor(lat_std, device=device, dtype=torch.float32)
+
+    log(f"train={len(train_ids)} val={len(val_ids)} test={len(test_ids)} latent_dim={latent_dim} seed={args.seed}")
+    best_val = float("inf")
+    best_epoch = 0
+    best_state = None
+    wait = 0
+    curve = []
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        train_losses = []
+        for batch_ids, x, mask, target in train_loader:
+            x = x.to(device)
+            mask = mask.to(device)
+            target = target.to(device)
+            opt.zero_grad(set_to_none=True)
+            pred = model(x, mask)
+            loss = mse(pred, target)
+            if args.ranking_loss_weight > 0 and decoy_idx:
+                pred_lat = pred * lat_std_t + lat_mean_t
+                pred_scaled = pred_lat @ comp_t
+                pred_y = pred_scaled * scale_t + mean_t
+                rloss = []
+                for bi, pid in enumerate(batch_ids):
+                    pos_np = pos_idx_map[pid]
+                    pos_set = set(int(v) for v in pos_np)
+                    neg_np = [j for j in decoy_idx if j not in pos_set] or decoy_idx
+                    pos = torch.tensor(pos_np, device=device, dtype=torch.long)
+                    neg = torch.tensor(neg_np, device=device, dtype=torch.long)
+                    rloss.append(
+                        torch.relu(
+                            torch.tensor(args.ranking_margin, device=device)
+                            - pred_y[bi, pos].mean()
+                            + pred_y[bi, neg].mean()
+                        )
+                    )
+                loss = loss + args.ranking_loss_weight * torch.stack(rloss).mean()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip)
+            opt.step()
+            train_losses.append(float(loss.detach().cpu()))
+
+        model.eval()
+        val_losses = []
+        with torch.no_grad():
+            for _, x, mask, target in val_loader:
+                pred = model(x.to(device), mask.to(device))
+                val_losses.append(float(mse(pred, target.to(device)).detach().cpu()))
+        train_loss = float(np.mean(train_losses))
+        val_loss = float(np.mean(val_losses))
+        curve.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
+        if val_loss < best_val:
+            best_val = val_loss
+            best_epoch = epoch
+            best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+            wait = 0
+        else:
+            wait += 1
+        if epoch == 1 or epoch % 10 == 0:
+            log(f"epoch={epoch} train_loss={train_loss:.5g} val_loss={val_loss:.5g} best_epoch={best_epoch}")
+        if wait >= args.patience:
+            log(f"early_stop epoch={epoch} best_epoch={best_epoch} best_val_loss={best_val:.5g}")
+            break
+
+    if best_state is None:
+        raise RuntimeError("No checkpoint state was captured")
+    model.load_state_dict(best_state)
+    ckpt_data = {
+        "svd_components": svd.components_.astype(np.float32),
+        "scaler_mean": scaler.mean_.astype(np.float32),
+        "scaler_scale": scaler.scale_.astype(np.float32),
+        "lat_mean": lat_mean.astype(np.float32),
+        "lat_std": lat_std.astype(np.float32),
+    }
+    val_metrics = eval_profile_metrics(model, val_ids, x_map, y, id2y, val_target, ckpt_data, args.batch_size, device)
+    test_metrics = eval_profile_metrics(model, test_ids, x_map, y, id2y, test_target, ckpt_data, args.batch_size, device)
+
+    checkpoint = {
+        "model_state_dict": best_state,
+        "model_config": {
+            "input_dim": int(next(iter(x_map.values())).shape[1]),
+            "hidden_dim": args.hidden_dim,
+            "latent_dim": latent_dim,
+            "kernel_size": args.kernel_size,
+            "num_blocks": args.num_blocks,
+            "dropout": args.dropout,
+        },
+        "preprocess": ckpt_data,
+        "kmers": kmers,
+        "train_ids": train_ids,
+        "val_ids": val_ids,
+        "test_ids": test_ids,
+        "best_epoch": best_epoch,
+        "best_val_loss": best_val,
+        "args": vars(args),
+    }
+    ckpt_path = out / "best_cnn_fixed_split_checkpoint.pt"
+    torch.save(checkpoint, ckpt_path)
+    pd.DataFrame(curve).to_csv(out / "training_curve.tsv", sep="\t", index=False)
+    summary = {
+        "checkpoint": str(ckpt_path),
+        "seed": args.seed,
+        "split_tsv": str(split_tsv),
+        "train_n": len(train_ids),
+        "val_n": len(val_ids),
+        "test_n": len(test_ids),
+        "best_epoch": best_epoch,
+        "best_val_loss": best_val,
+        "val_metrics": val_metrics,
+        "test_metrics": test_metrics,
+    }
+    (out / "training_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    with gzip.open(out / "split_ids_used.tsv.gz", "wt") as handle:
+        handle.write("split\tprotein_id\n")
+        for split_name, ids in [("train", train_ids), ("val", val_ids), ("test", test_ids)]:
+            for pid in ids:
+                handle.write(f"{split_name}\t{pid}\n")
+    log(f"checkpoint={ckpt_path}")
+    log(f"best_epoch={best_epoch} val_pearson={val_metrics.get('pearson_mean')} test_pearson={test_metrics.get('pearson_mean')}")
+
+
+if __name__ == "__main__":
+    main()

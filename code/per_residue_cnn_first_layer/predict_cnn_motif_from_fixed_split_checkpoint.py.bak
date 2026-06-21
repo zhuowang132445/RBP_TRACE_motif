@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""Predict query motifs from a fixed-split per-residue CNN checkpoint."""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import json
+import os
+import sys
+from pathlib import Path
+
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import DataLoader
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT = SCRIPT_DIR.parents[1]
+sys.path.insert(0, str(SCRIPT_DIR))
+
+from cnn_model_utils import PerResidueCnn, RbdEmbeddingDataset, collate_batch, load_h5_features, resolve_path, setup_threads  # noqa: E402
+
+
+def log(msg: str) -> None:
+    print(f"[fixed-split-cnn-predict] {msg}", flush=True)
+
+
+def reconstruct(pred_z: np.ndarray, preprocess: dict[str, np.ndarray]) -> np.ndarray:
+    pred_lat = pred_z * preprocess["lat_std"] + preprocess["lat_mean"]
+    pred_scaled = pred_lat @ preprocess["svd_components"]
+    return pred_scaled * preprocess["scaler_scale"] + preprocess["scaler_mean"]
+
+
+def short_id(pid: str) -> str:
+    return pid.split("|", 1)[0]
+
+
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--checkpoint", required=True)
+    ap.add_argument("--query-h5", action="append", required=True)
+    ap.add_argument("--query-manifest", action="append", default=[])
+    ap.add_argument("--query-label", action="append", default=[])
+    ap.add_argument("--output-dir", required=True)
+    ap.add_argument("--device", default="cuda", choices=["cpu", "cuda", "auto"])
+    ap.add_argument("--gpu-memory-fraction", type=float, default=0.20)
+    ap.add_argument("--batch-size", type=int, default=1)
+    ap.add_argument("--top-n", type=int, default=50)
+    ap.add_argument("--torch-num-threads", type=int, default=1)
+    return ap.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    setup_threads(args.torch_num_threads)
+    if args.device == "auto":
+        args.device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.device == "cuda" and not torch.cuda.is_available():
+        args.device = "cpu"
+    device = torch.device(args.device)
+    if device.type == "cuda" and args.gpu_memory_fraction > 0:
+        torch.cuda.set_per_process_memory_fraction(args.gpu_memory_fraction, 0)
+
+    ckpt_path = resolve_path(args.checkpoint, [Path(args.checkpoint).name])
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    cfg = ckpt["model_config"]
+    preprocess = {k: np.asarray(v, dtype=np.float32) for k, v in ckpt["preprocess"].items()}
+    kmers = np.asarray(ckpt["kmers"]).astype(str)
+
+    model = PerResidueCnn(
+        cfg["input_dim"],
+        cfg["hidden_dim"],
+        cfg["latent_dim"],
+        cfg["kernel_size"],
+        cfg["num_blocks"],
+        cfg["dropout"],
+    ).to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+
+    manifests = list(args.query_manifest)
+    while len(manifests) < len(args.query_h5):
+        manifests.append(None)
+    labels = list(args.query_label)
+    while len(labels) < len(args.query_h5):
+        labels.append(Path(args.query_h5[len(labels)]).stem)
+
+    query_x: dict[str, np.ndarray] = {}
+    query_len: dict[str, int] = {}
+    source_label: dict[str, str] = {}
+    for h5_text, manifest_text, label in zip(args.query_h5, manifests, labels):
+        h5_path = resolve_path(h5_text, [Path(h5_text).name])
+        manifest_path = resolve_path(manifest_text, [Path(manifest_text).name], required=False) if manifest_text else None
+        x_map, len_map = load_h5_features(h5_path, manifest_path)
+        for pid, arr in x_map.items():
+            key = pid
+            if key in query_x:
+                key = f"{label}|{pid}"
+            query_x[key] = arr
+            query_len[key] = len_map[pid]
+            source_label[key] = label
+
+    out = Path(args.output_dir)
+    out = ROOT / out if not out.is_absolute() else out
+    out.mkdir(parents=True, exist_ok=True)
+
+    dummy_ids = {pid: i for i, pid in enumerate(query_x)}
+    dummy_y = np.zeros((len(query_x), cfg["latent_dim"]), dtype=np.float32)
+    loader = DataLoader(
+        RbdEmbeddingDataset(list(query_x), query_x, dummy_y, dummy_ids),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=collate_batch,
+    )
+
+    rows = []
+    matrix_rows = []
+    with torch.no_grad():
+        for ids, x, mask, _ in loader:
+            pred_z = model(x.to(device), mask.to(device)).cpu().numpy()
+            pred_y = reconstruct(pred_z, preprocess)
+            for pid, pred in zip(ids, pred_y):
+                matrix_rows.append((pid, pred))
+                for rank, idx in enumerate(np.argsort(-pred)[: args.top_n], 1):
+                    rows.append(
+                        {
+                            "query_id": pid,
+                            "short_id": short_id(pid),
+                            "source": source_label.get(pid, ""),
+                            "rank": rank,
+                            "kmer": kmers[idx],
+                            "score": float(pred[idx]),
+                            "rbd_length": query_len.get(pid, np.nan),
+                        }
+                    )
+
+    pd.DataFrame(rows).to_csv(out / "query_cnn_fixed_split_top_predicted_7mers.tsv", sep="\t", index=False)
+    with gzip.open(out / "query_cnn_fixed_split_score_matrix.tsv.gz", "wt") as handle:
+        handle.write("query_id\t" + "\t".join(kmers) + "\n")
+        for pid, pred in matrix_rows:
+            handle.write(pid + "\t" + "\t".join(f"{float(v):.6g}" for v in pred) + "\n")
+    summary = {
+        "checkpoint": str(ckpt_path),
+        "best_epoch": ckpt.get("best_epoch"),
+        "best_val_loss": ckpt.get("best_val_loss"),
+        "n_query": len(query_x),
+        "top_n": args.top_n,
+    }
+    (out / "query_cnn_fixed_split_prediction_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    log(f"predictions={out / 'query_cnn_fixed_split_top_predicted_7mers.tsv'}")
+
+
+if __name__ == "__main__":
+    main()
