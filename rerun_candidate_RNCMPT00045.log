@@ -1,0 +1,6 @@
+[jple-embedding-variants] finished pooled JPLE prediction
+[jple-embedding-variants] per_residue_CNN epoch=1 loss=0.139959
+[jple-embedding-variants] per_residue_CNN epoch=25 loss=0.00458113
+[jple-embedding-variants] per_residue_CNN epoch=50 loss=0.00297188
+[jple-embedding-variants] per_residue_CNN epoch=75 loss=0.00235629
+[jple-embedding-variants] finished per-residue CNN -> JPLE latent prediction
